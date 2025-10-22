@@ -1,0 +1,72 @@
+# =======================================================
+#   AutoML Project - Git Ignore Rules
+# =======================================================
+
+# 🔒 Environment and secrets
+.env
+*.env
+*.env.*
+
+# 🧠 Cache, temporary, and generated files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.bak
+
+# 🧩 Retriever cache and generated outputs
+retriever/cache/
+retriever/__pycache__/
+retriever/*.log
+retriever/results_log.json
+retriever/dataset_summary_*.json
+retriever/candidate_*.py
+
+# 🧪 Intermediate models or serialized objects
+*.pkl
+*.joblib
+*.sav
+*.h5
+*.onnx
+
+# 📊 Data and experiment outputs
+data/*.csv
+data/*.xlsx
+outputs/
+results/
+logs/
+experiments/
+checkpoints/
+
+# 🧰 Python virtual environments
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+
+# 🧱 Build and packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# 🧠 IDE and editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# 📁 OS-specific files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 🔍 Misc
+*.swp
+*.lock
+*.orig
