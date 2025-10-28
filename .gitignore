@@ -22,7 +22,6 @@ retriever/__pycache__/
 retriever/*.log
 retriever/results_log.json
 retriever/dataset_summary_*.json
-retriever/candidate_*.py
 
 # 🧪 Intermediate models or serialized objects
 *.pkl
