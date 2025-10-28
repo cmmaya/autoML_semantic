@@ -19,29 +19,50 @@ class _ModelSwapTransformer(ast.NodeTransformer):
         self.new_import_needed: Optional[Tuple[str, str, Optional[str]]] = None # (module, name, alias)
 
     def visit_Assign(self, node: ast.Assign) -> ast.AST:
-        # We're looking for an assignment, e.g., `model = RandomForestClassifier()`
+        # Detect assignment like: model = RandomForestClassifier()
         if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
             if node.value.func.id == self.model_to_swap:
                 logging.info(f"Found model instantiation for '{node.value.func.id}'. Swapping with '{self.new_model.name}'.")
-                
-                new_model_uid_parts = self.new_model.uid.split('.')
+
+                new_model_uid_parts = self.new_model.uid.split(".")
                 class_name = self.new_model.name
-                
-                # Logic to handle different import styles
-                if len(new_model_uid_parts) > 1 and new_model_uid_parts[0] != class_name:
-                    # e.g., import xgboost as xgb -> xgb.XGBClassifier
+
+                # --- Robust model call handling ---
+                # 1️ Handle single-level UIDs (e.g., xgboost.XGBClassifier)
+                if len(new_model_uid_parts) == 2:
                     module_name = new_model_uid_parts[0]
-                    alias = module_name # Simple alias for now
-                    node.value.func = ast.Attribute(value=ast.Name(id=alias, ctx=ast.Load()), attr=class_name, ctx=ast.Load())
-                    self.new_import_needed = (module_name, class_name, alias)
-                else: 
-                    # e.g., from sklearn.ensemble import RandomForestClassifier
-                    node.value.func.id = class_name
+                    node.value.func = ast.Attribute(
+                        value=ast.Name(id=module_name, ctx=ast.Load()),
+                        attr=class_name,
+                        ctx=ast.Load()
+                    )
+                    self.new_import_needed = (module_name, class_name, None)
+
+                # 2️ Handle sklearn-style deep imports (sklearn.ensemble.RandomForestClassifier)
+                elif new_model_uid_parts[0] == "sklearn" and len(new_model_uid_parts) > 2:
+                    node.value.func = ast.Name(id=class_name, ctx=ast.Load())
                     module_path = ".".join(new_model_uid_parts[:-1])
                     self.new_import_needed = (module_path, class_name, None)
 
-                node.value.keywords = [] # Discard old keywords
+                # 3️ Handle weird submodules (like torch.nn.Linear)
+                elif len(new_model_uid_parts) > 2:
+                    top_module = new_model_uid_parts[0]
+                    node.value.func = ast.Attribute(
+                        value=ast.Name(id=top_module, ctx=ast.Load()),
+                        attr=class_name,
+                        ctx=ast.Load()
+                    )
+                    self.new_import_needed = (".".join(new_model_uid_parts[:-1]), class_name, None)
+
+                # 4️ Fallback (unknown pattern)
+                else:
+                    node.value.func = ast.Name(id=class_name, ctx=ast.Load())
+                    self.new_import_needed = (".".join(new_model_uid_parts[:-1]), class_name, None)
+
+                # Clear old hyperparameters to avoid conflicts
+                node.value.keywords = []
                 self.successful_swap = True
+
         return self.generic_visit(node)
 
 class StructuralSwapStrategy(BaseStrategy):
