@@ -73,14 +73,15 @@ class RetrieverAgent:
         self.model = GPT5_MODEL
 
     def _build_prompt(self, dataset_summary: Dict) -> str:
-        prompt =f"""
-You are an AutoML expert.
+        prompt = f"""
+You are an AutoML expert specialized in scikit-learn.
 
 Generate 3 different script proposals in **valid JSON** format.
 Each script must:
-- Use well-known libraries (scikit-learn, XGBoost, or LightGBM)
+
+- Use ONLY the scikit-learn library (no XGBoost, LightGBM, or external ML frameworks)
 - Define the following key variables explicitly:
-  - `model`: the main estimator instance
+  - `model`: the main estimator instance (e.g., LogisticRegression, RandomForestClassifier, SVC)
   - `param_grid`: dictionary of hyperparameters to tune
   - `auc`: final float metric (Area Under ROC Curve)
 - Train and evaluate the model on the given dataset
@@ -102,7 +103,7 @@ Response format (must be strictly valid JSON, no markdown, no text outside the a
   {{
     "name": "Model Name",
     "description": "Short one-line explanation",
-    "code_snippet": "Minimal working Python code that prints {{\\"auc\\": value}}"
+    "code_snippet": "Minimal working Python code using scikit-learn that prints {{\\"auc\\": value}}"
   }},
   {{
     "name": "...",
@@ -121,8 +122,6 @@ Do not exceed 7000 tokens.
 Dataset summary:
 {json.dumps(dataset_summary, indent=2)}
 """
-
-
         return prompt.strip()
 
     def retrieve_contextual_examples(self, dataset_summary: Dict) -> List[Dict]:
@@ -160,7 +159,6 @@ Dataset summary:
             return []
 
         result_text = response.json()["choices"][0]["message"]["content"]
-        # result_text = '[\n  {\n    "name": "Sklearn Logistic AUC Pipeline",\n    "description": "Pipeline con OHE e imputación + GridSearchCV optimizando AUC.",\n    "code_snippet": "import pandas as pd\\nfrom sklearn.model_selection import StratifiedKFold, GridSearchCV\\nfrom sklearn.pipeline import Pipeline\\nfrom sklearn.compose import ColumnTransformer\\nfrom sklearn.preprocessing import OneHotEncoder\\nfrom sklearn.impute import SimpleImputer\\nfrom sklearn.linear_model import LogisticRegression\\n\\ndf=pd.read_csv(\\"data\\\\\\\\train.csv\\")\\ny=df[\\"Survived\\"]\\nX=df.drop(columns=[\\"Survived\\"])\\nnum=X.select_dtypes(\\"number\\").columns\\ncat=X.columns.difference(num)\\npre=ColumnTransformer([\\n    (\\"n\\",SimpleImputer(strategy=\\"median\\"),num),\\n    (\\"c\\",Pipeline([(\\"imp\\",SimpleImputer(strategy=\\"most_frequent\\")),(\\"ohe\\",OneHotEncoder(handle_unknown=\\"ignore\\"))]),cat)\\n])\\npipe=Pipeline([(\\"pre\\",pre),(\\"clf\\",LogisticRegression(max_iter=2000,class_weight=\\"balanced\\",solver=\\"liblinear\\"))])\\nparam={\\"clf__C\\":[0.1,0.3,1,3,10],\\"clf__penalty\\":[\\"l1\\",\\"l2\\"]}\\ncv=StratifiedKFold(5,shuffle=True,random_state=42)\\ngs=GridSearchCV(pipe,param,scoring=\\"roc_auc\\",cv=cv,n_jobs=-1)\\ngs.fit(X,y)\\nprint(\\"Best AUC:\\",gs.best_score_,\\"Params:\\",gs.best_params_)"\n  },\n  {\n    "name": "XGBoost AUC Pipeline",\n    "description": "XGBoost con preprocesamiento y RandomizedSearchCV maximizando AUC.",\n    "code_snippet": "import pandas as pd\\nfrom sklearn.model_selection import StratifiedKFold, RandomizedSearchCV\\nfrom sklearn.pipeline import Pipeline\\nfrom sklearn.compose import ColumnTransformer\\nfrom sklearn.preprocessing import OneHotEncoder\\nfrom sklearn.impute import SimpleImputer\\nimport xgboost as xgb\\n\\ndf=pd.read_csv(\\"data\\\\\\\\train.csv\\")\\ny=df[\\"Survived\\"]\\nX=df.drop(columns=[\\"Survived\\"])\\nnum=X.select_dtypes(\\"number\\").columns\\ncat=X.columns.difference(num)\\npre=ColumnTransformer([\\n    (\\"n\\",SimpleImputer(strategy=\\"median\\"),num),\\n    (\\"c\\",Pipeline([(\\"imp\\",SimpleImputer(strategy=\\"most_frequent\\")),(\\"ohe\\",OneHotEncoder(handle_unknown=\\"ignore\\"))]),cat)\\n])\\nspw=(len(y)-y.sum())/y.sum()\\nclf=xgb.XGBClassifier(objective=\\"binary:logistic\\",eval_metric=\\"auc\\",tree_method=\\"hist\\",n_estimators=800,learning_rate=0.05,subsample=0.8,colsample_bytree=0.8,random_state=42,n_jobs=-1,scale_pos_weight=spw)\\npipe=Pipeline([(\\"pre\\",pre),(\\"clf\\",clf)])\\nparam={\\n \\"clf__max_depth\\":[3,4,5,6],\\n \\"clf__min_child_weight\\":[1,2,4,6],\\n \\"clf__gamma\\":[0,0.1,0.3],\\n \\"clf__reg_alpha\\":[0,0.1,0.5],\\n \\"clf__reg_lambda\\":[0.5,1,2]\\n}\\ncv=StratifiedKFold(5,shuffle=True,random_state=42)\\nrs=RandomizedSearchCV(pipe,param,n_iter=25,scoring=\\"roc_auc\\",cv=cv,n_jobs=-1,random_state=42)\\nrs.fit(X,y)\\nprint(\\"Best AUC:\\",rs.best_score_,\\"Params:\\",rs.best_params_)"\n  },\n  {\n    "name": "LightGBM AUC Pipeline",\n    "description": "LightGBM con categorías nativas y RandomizedSearchCV optimizando AUC.",\n    "code_snippet": "import pandas as pd\\nfrom sklearn.model_seleccion import StratifiedKFold, RandomizedSearchCV\\nimport lightgbm as lgb\\n\\ndf=pd.read_csv(\\"data\\\\\\\\train.csv\\")\\ny=df[\\"Survived\\"]\\nX=df.drop(columns=[\\"Survived\\"])\\ncat=X.select_dtypes(exclude=[\\"number\\"]).columns\\nfor c in cat: X[c]=X[c].astype(\\"category\\")\\nspw=(len(y)-y.sum())/y.sum()\\nclf=lgb.LGBMClassifier(objective=\\"binary\\",metric=\\"auc\\",n_estimators=1500,learning_rate=0.03,subsample=0.9,colsample_bytree=0.8,random_state=42,n_jobs=-1,scale_pos_weight=spw,verbose=-1)\\nparam={\\n \\"num_leaves\\":[31,63,127],\\n \\"max_depth\\":[-1,5,7,9],\\n \\"min_child_samples\\":[10,20,40],\\n \\"reg_alpha\\":[0,0.1,0.5],\\n \\"reg_lambda\\":[0,0.1,0.5]\\n}\\ncv=StratifiedKFold(5,shuffle=True,random_state=42)\\nrs=RandomizedSearchCV(clf,param,n_iter=20,scoring=\\"roc_auc\\",cv=cv,n_jobs=-1,random_state=42)\\nrs.fit(X,y)\\nprint(\\"Best AUC:\\",rs.best_score_,\\"Params:\\",rs.best_params_)"\n  }\n]'
         # 🔧 Sanitización antes del parseo JSON
         # ==========================================================
         clean_text = sanitize_result_text(result_text)

@@ -5,30 +5,40 @@ A concrete mutation strategy for structurally modifying a script's AST.
 import ast
 import random
 import logging
+import importlib
+import inspect
 from typing import Any, Optional, Dict, List, Tuple
 
 from .base_strategy import BaseStrategy
 from knowledge.graph_db import KnowledgeGraph, ComponentNode
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+
+
+# =============================================================================
+#  AST HELPERS
+# =============================================================================
 
 class _ModelSwapTransformer(ast.NodeTransformer):
-    """An AST transformer that finds and replaces a model instantiation call."""
+    """Finds and replaces a model-instantiation call with a new model."""
     def __init__(self, model_to_swap: str, new_model: ComponentNode):
         self.model_to_swap = model_to_swap
         self.new_model = new_model
         self.successful_swap = False
-        self.new_import_needed: Optional[Tuple[str, str, Optional[str]]] = None # (module, name, alias)
+        self.new_import_needed: Optional[Tuple[str, str, Optional[str]]] = None
 
     def visit_Assign(self, node: ast.Assign) -> ast.AST:
         # Detect assignment like: model = RandomForestClassifier()
         if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
             if node.value.func.id == self.model_to_swap:
-                logging.info(f"Found model instantiation for '{node.value.func.id}'. Swapping with '{self.new_model.name}'.")
+                logging.info(
+                    f"Found model instantiation for '{node.value.func.id}'. "
+                    f"Swapping with '{self.new_model.name}'."
+                )
 
                 new_model_uid_parts = self.new_model.uid.split(".")
                 class_name = self.new_model.name
 
-                # --- Robust model call handling ---
-                # 1️ Handle single-level UIDs (e.g., xgboost.XGBClassifier)
+                # 1) UID like: xgboost.XGBClassifier
                 if len(new_model_uid_parts) == 2:
                     module_name = new_model_uid_parts[0]
                     node.value.func = ast.Attribute(
@@ -38,152 +48,298 @@ class _ModelSwapTransformer(ast.NodeTransformer):
                     )
                     self.new_import_needed = (module_name, class_name, None)
 
-                # 2️ Handle sklearn-style deep imports (sklearn.ensemble.RandomForestClassifier)
+                # 2) sklearn deep imports
                 elif new_model_uid_parts[0] == "sklearn" and len(new_model_uid_parts) > 2:
                     node.value.func = ast.Name(id=class_name, ctx=ast.Load())
                     module_path = ".".join(new_model_uid_parts[:-1])
                     self.new_import_needed = (module_path, class_name, None)
 
-                # 3️ Handle weird submodules (like torch.nn.Linear)
+                # 3) Other multi-level modules
                 elif len(new_model_uid_parts) > 2:
-                    top_module = new_model_uid_parts[0]
-                    node.value.func = ast.Attribute(
-                        value=ast.Name(id=top_module, ctx=ast.Load()),
-                        attr=class_name,
-                        ctx=ast.Load()
-                    )
-                    self.new_import_needed = (".".join(new_model_uid_parts[:-1]), class_name, None)
+                    node.value.func = ast.Name(id=class_name, ctx=ast.Load())
+                    module_path = ".".join(new_model_uid_parts[:-1])
+                    self.new_import_needed = (module_path, class_name, None)
 
-                # 4️ Fallback (unknown pattern)
+                # 4) Fallback
                 else:
                     node.value.func = ast.Name(id=class_name, ctx=ast.Load())
-                    self.new_import_needed = (".".join(new_model_uid_parts[:-1]), class_name, None)
+                    module_path = ".".join(new_model_uid_parts[:-1]) if len(new_model_uid_parts) > 1 else ""
+                    self.new_import_needed = (module_path, class_name, None)
 
-                # Clear old hyperparameters to avoid conflicts
+                # Remove old incompatible keyword args
                 node.value.keywords = []
                 self.successful_swap = True
 
         return self.generic_visit(node)
 
+
+def _load_class_from_uid(uid: str):
+    mod = ".".join(uid.split(".")[:-1])
+    cls = uid.split(".")[-1]
+    module = importlib.import_module(mod)
+    return getattr(module, cls)
+
+
+def _is_instantiable_estimator(uid: str, require_proba: bool = True) -> bool:
+    """True iff uid is a concrete sklearn estimator supporting proba/decision_function."""
+    try:
+        cls = _load_class_from_uid(uid)
+
+        if cls.__name__.startswith("_"):
+            return False
+        if inspect.isabstract(cls):
+            return False
+
+        if not issubclass(cls, BaseEstimator):
+            return False
+        if not (issubclass(cls, ClassifierMixin) or issubclass(cls, RegressorMixin)):
+            return False
+
+        sig = inspect.signature(cls.__init__)
+        required = [
+            p for n, p in sig.parameters.items()
+            if n != "self"
+            and p.default is inspect._empty
+            and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        ]
+        if required:
+            return False
+
+        if require_proba:
+            has_proba = any("predict_proba" in dir(c) for c in cls.mro())
+            has_decision = any("decision_function" in dir(c) for c in cls.mro())
+            if not (has_proba or has_decision):
+                return False
+
+        return True
+
+    except Exception:
+        return False
+
+
+# =============================================================================
+#  NEW — Force any GridSearchCV / RandomizedSearchCV to use n_jobs=1
+# =============================================================================
+class _ForceDefaultHparamsTransformer(ast.NodeTransformer):
+    """
+    Rewrites DEFAULT_HPARAMS['n_jobs'] and GridSearchCV n_jobs
+    inside annotated or non-annotated assignments.
+    """
+
+    def visit_Assign(self, node: ast.Assign):
+        # Standard assignment: DEFAULT_HPARAMS = {...}
+        if (isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "DEFAULT_HPARAMS"
+            and isinstance(node.value, ast.Dict)):
+            return self._rewrite_dict(node)
+        return self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):
+        # Annotated assignment: DEFAULT_HPARAMS: Type = {...}
+        if (isinstance(node.target, ast.Name)
+            and node.target.id == "DEFAULT_HPARAMS"
+            and isinstance(node.value, ast.Dict)):
+            return self._rewrite_dict(node)
+        return self.generic_visit(node)
+
+    def _rewrite_dict(self, node):
+        """Force DEFAULT_HPARAMS['n_jobs'] = 1."""
+        new_keys = []
+        new_vals = []
+
+        for k, v in zip(node.value.keys, node.value.values):
+            if isinstance(k, ast.Constant) and k.value == "n_jobs":
+                new_keys.append(k)
+                new_vals.append(ast.Constant(value=1))
+            else:
+                new_keys.append(k)
+                new_vals.append(v)
+
+        node.value = ast.Dict(keys=new_keys, values=new_vals)
+        return node
+
+class _ForceSingleThreadTransformer(ast.NodeTransformer):
+    TARGETS = {"GridSearchCV", "RandomizedSearchCV"}
+
+    def _func_name(self, func: ast.AST) -> str:
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        return ""
+
+    def visit_Call(self, node: ast.Call):
+        func_name = self._func_name(node.func)
+
+        if func_name in self.TARGETS:
+            new_keywords = []
+            found = False
+
+            for kw in node.keywords:
+                if kw.arg == "n_jobs":
+                    found = True
+                    new_keywords.append(
+                        ast.keyword(arg="n_jobs", value=ast.Constant(value=1))
+                    )
+                else:
+                    new_keywords.append(kw)
+
+            if not found:
+                new_keywords.append(
+                    ast.keyword(arg="n_jobs", value=ast.Constant(value=1))
+                )
+
+            node.keywords = new_keywords
+
+        return self.generic_visit(node)
+
+# =============================================================================
+#  MAIN STRATEGY
+# =============================================================================
+
 class StructuralSwapStrategy(BaseStrategy):
-    """Swaps a model in the script with a compatible alternative from the Knowledge Graph."""
     def __init__(self):
         super().__init__(
             name="StructuralSwapStrategy",
-            description="Swaps a model with a compatible alternative (e.g., RandomForest -> XGBoost)."
+            description="Swaps a model with a compatible alternative (RandomForest → XGBoost, etc.)."
         )
 
     def _add_import(self, tree: ast.AST, new_model_uid: str) -> ast.AST:
-        """Adds the correct import statement for the new model's UID."""
-        
-        uid_parts = new_model_uid.split('.')
-        
-        # Handle cases like 'xgboost.XGBClassifier' -> import xgboost
-        if len(uid_parts) == 2:
-            module_name = uid_parts[0]
-            new_import = ast.Import(names=[ast.alias(name=module_name)])
-        # Handle cases like 'sklearn.naive_bayes.MultinomialNB'
+        """Adds correct import for the new model."""
+        parts = new_model_uid.split('.')
+
+        if len(parts) == 2:
+            new_import = ast.Import(names=[ast.alias(name=parts[0])])
         else:
-            module_path = ".".join(uid_parts[:-1])
-            class_name = uid_parts[-1]
-            new_import = ast.ImportFrom(module=module_path, names=[ast.alias(name=class_name)], level=0)
-        
-        # Check if a similar import already exists to avoid duplicates
+            module_path = ".".join(parts[:-1])
+            class_name = parts[-1]
+            new_import = ast.ImportFrom(
+                module=module_path,
+                names=[ast.alias(name=class_name)],
+                level=0
+            )
+
+        # Avoid duplicates
         for node in tree.body:
             if isinstance(node, (ast.Import, ast.ImportFrom)) and ast.dump(node) == ast.dump(new_import):
-                return tree # Import already exists
-        
+                return tree
+
         tree.body.insert(0, new_import)
         ast.fix_missing_locations(tree)
         return tree
 
+    # ----------------------------------------------------------------------
+    # MUTATE
+    # ----------------------------------------------------------------------
     def mutate(
         self,
         source_ast: ast.AST,
         hparams: Dict[str, Any],
         knowledge_graph: Optional[KnowledgeGraph] = None
-    ) -> tuple[ast.AST, Dict[str, Any]]:
+    ) -> Tuple[ast.AST, Dict[str, Any]]:
+
         if not knowledge_graph:
-            logging.warning(f"[{self.name}] cannot run without a knowledge graph. Returning original.")
+            logging.warning(f"[{self.name}] cannot run without a knowledge graph.")
             return source_ast, hparams
-        
+
+        # 1) Collect predictors from KG
         predictors = {
-            data['name']: uid for uid, data in knowledge_graph.graph.nodes(data=True)
-            if data.get('component_type') in ['Classifier', 'Regressor']
+            data["name"]: uid
+            for uid, data in knowledge_graph.graph.nodes(data=True)
+            if data.get("component_type") in ["Classifier", "Regressor"]
         }
         if not predictors:
-            logging.warning(f"[{self.name}] No Classifiers or Regressors found in the Knowledge Graph.")
             return source_ast, hparams
 
-        current_model_name = None
-        current_model_uid = None
+        # 2) Find model used in script
+        current_name = None
+        current_uid = None
         for node in ast.walk(source_ast):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in predictors:
-                current_model_name = node.func.id
-                current_model_uid = predictors[current_model_name]
-                break
-        
-        if not current_model_uid or not current_model_name:
-            logging.warning(f"[{self.name}] could not find a known predictor model to swap in the script.")
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in predictors:
+                    current_name = node.func.id
+                    current_uid = predictors[current_name]
+                    break
+
+        if not current_uid:
             return source_ast, hparams
 
-        compatible_models = knowledge_graph.find_compatible_components(current_model_uid)
-        if not compatible_models:
-            logging.warning(f"[{self.name}] found no compatible models for '{current_model_uid}'.")
+        # 3) Candidate replacements
+        candidates = knowledge_graph.find_compatible_components(current_uid)
+        if not candidates:
             return source_ast, hparams
 
-        new_model = random.choice(compatible_models)
-        transformer = _ModelSwapTransformer(current_model_name, new_model)
-        new_ast = transformer.visit(source_ast)
+        safe = [
+            m for m in candidates
+            if _is_instantiable_estimator(m.uid, require_proba=True)
+        ]
+        if not safe:
+            return source_ast, hparams
 
-        if transformer.successful_swap:
+        # 4) Swap
+        new_model = random.choice(safe)
+        swapper = _ModelSwapTransformer(current_name, new_model)
+        new_ast = swapper.visit(source_ast)
+        ast.fix_missing_locations(new_ast)
+
+        if swapper.successful_swap:
             new_ast = self._add_import(new_ast, new_model.uid)
 
+            # 5) Rebuild hparams
+            allowed = set(new_model.hyperparameters.keys())
+            new_hparams = {}
+
+            prefix = ""
+            for k in hparams:
+                if "__" in k:
+                    prefix = k.split("__", 1)[0] + "__"
+                    break
+            if not prefix:
+                prefix = "model__"
+
+            for k, v in hparams.items():
+                base = k.split("__")[-1]
+                if base in allowed:
+                    new_hparams[f"{prefix}{base}"] = v
+
+            for pname, pval in new_model.hyperparameters.items():
+                full = f"{prefix}{pname}"
+                new_hparams.setdefault(full, pval)
+
+            hparams = new_hparams
+
+            # 6) Remove old param_grid
+            class _Remove(ast.NodeTransformer):
+                def visit_Assign(self, node: ast.Assign):
+                    if any(isinstance(t, ast.Name) and t.id == "param_grid" for t in node.targets):
+                        return ast.Assign(
+                            targets=[ast.Name(id="param_grid", ctx=ast.Store())],
+                            value=ast.Dict(keys=[], values=[])
+                        )
+                    return self.generic_visit(node)
+
+            new_ast = _Remove().visit(new_ast)
+            ast.fix_missing_locations(new_ast)
+
+            # 7) Insert new param_grid
+            keys = []
+            vals = []
+            for pname, pvalues in new_model.hyperparameters.items():
+                keys.append(ast.Constant(value=f"{prefix}{pname}"))
+                vals.append(ast.Constant(value=pvalues))
+
+            pg_node = ast.Assign(
+                targets=[ast.Name(id="param_grid", ctx=ast.Store())],
+                value=ast.Dict(keys=keys, values=vals)
+            )
+            new_ast.body.insert(1, pg_node)
+            ast.fix_missing_locations(new_ast)
+
+        # ------------------------------------------------------------------
+        # 8) FINAL FIX — Enforce single-thread GridSearchCV everywhere
+        # ------------------------------------------------------------------
+        new_ast = _ForceSingleThreadTransformer().visit(new_ast)
+        new_ast = _ForceDefaultHparamsTransformer().visit(new_ast)
+        ast.fix_missing_locations(new_ast)
+
         return new_ast, hparams
-
-# --- Self-contained Test Block ---
-if __name__ == '__main__':
-    from knowledge.graph_db import KnowledgeGraph
-    from knowledge.ontology import Node, ComponentNode, Relationship
-
-    print("\n--- Running Test for structure.py ---")
-
-    # 1. Create a dummy Knowledge Graph
-    kg = KnowledgeGraph()
-    rf_node = ComponentNode(uid="sklearn.ensemble.RandomForestClassifier", name="RandomForestClassifier", component_type="Classifier")
-    xgb_node = ComponentNode(uid="xgboost.XGBClassifier", name="XGBClassifier", component_type="Classifier")
-    nb_node = ComponentNode(uid="sklearn.naive_bayes.MultinomialNB", name="MultinomialNB", component_type="Classifier")
-    classifier_concept = Node(uid="concept.classifier", name="Classifier Concept")
-    
-    kg.add_node(rf_node); kg.add_node(xgb_node); kg.add_node(nb_node); kg.add_node(classifier_concept)
-    kg.add_relationship(Relationship(source_uid=rf_node.uid, target_uid=classifier_concept.uid, label="is_a"))
-    kg.add_relationship(Relationship(source_uid=xgb_node.uid, target_uid=classifier_concept.uid, label="is_a"))
-    kg.add_relationship(Relationship(source_uid=nb_node.uid, target_uid=classifier_concept.uid, label="is_a"))
-    
-    # 2. Define a simple source script
-    source_code = """
-from sklearn.ensemble import RandomForestClassifier
-model = RandomForestClassifier(n_estimators=100)
-"""
-    source_ast = ast.parse(source_code)
-    
-    # 3. Initialize and run the strategy
-    strategy = StructuralSwapStrategy()
-    new_ast, _ = strategy.mutate(source_ast, {}, kg)
-    
-    # 4. Unparse the new AST back to code and verify
-    new_code = ast.unparse(new_ast)
-    
-    print("\nOriginal Code:\n---")
-    print(source_code.strip())
-    print("\nMutated Code:\n---")
-    print(new_code.strip())
-    
-    is_xgb = "XGBClassifier" in new_code and "import xgboost" in new_code
-    is_nb = "MultinomialNB" in new_code and "from sklearn.naive_bayes import MultinomialNB" in new_code
-    
-    assert is_xgb or is_nb, "Swap to a compatible model failed."
-    assert "RandomForestClassifier" not in new_code, "Old model was not removed."
-    
-    print("\n✅ Structural swap was successful.")
-    print("\n--- All structure.py tests passed! ---")

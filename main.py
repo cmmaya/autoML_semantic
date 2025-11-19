@@ -53,6 +53,7 @@ def build_strategies(data_path: Path, use_gp: bool = True):
     hparam_strategy = RandomHyperparameterMutation()
     structural_strategy = StructuralSwapStrategy()
     strategies.extend([hparam_strategy, structural_strategy])
+    # strategies.extend([structural_strategy])
 
     # Conditional GP feature engineering
     if use_gp:
@@ -106,28 +107,38 @@ def run(
     # ===================================================
     # ① Optional Retriever Integration
     # ===================================================
+    retriever_script_path = None
+
     if retriever_enabled:
-        console.rule("[bold magenta]Running Semantic Retriever (GPT-5 + web_search)[/bold magenta]")
+        console.rule("[bold magenta]Running Semantic Retriever[/bold magenta]")
         try:
-            best_initial_script = run_semantic_retriever(data_path, scripts[0], metric_to_optimize)
+            best_initial_script = run_semantic_retriever(
+                data_path,
+                scripts[0],
+                metric_to_optimize
+            )
+
             if best_initial_script:
+                retriever_script_path = best_initial_script
                 scripts = [best_initial_script]
-                console.print(f"[green]✅ Retriever produced optimized initial script.[/green]")
+                console.print("[green]Retriever produced optimized initial script.[/green]")
+                scripts = normalize_scripts(scripts, llm=True) # Normalize scripts before optimizer setup
+
         except Exception as e:
             console.print(f"[red]Retriever failed: {e}[/red]")
 
-    # ===================================================
-    # ② Mutation Strategies
-    # ===================================================
+    from pathlib import Path
+    retriever_script_path = Path("retriever/cache/Logistic_Regression__SAGA__Pipeline.py")
+
+    #  Build Mutation Strategies
     all_strategies = build_strategies(data_path, use_gp=use_gp)
-    # ===================================================
-    # 🧩 Normalize scripts before optimizer setup
-    # ===================================================
-    scripts = normalize_scripts(scripts)
-    # ===================================================
-    # ③ Optimizer Setup
-    # ===================================================
-    config = OptimizerConfig(num_generations=generations, population_size=population)
+
+    #  Optimizer Setup
+    config = OptimizerConfig(
+        num_generations=generations,
+        population_size=population
+    )
+
     optimizer = MultiScriptOptimizer(
         script_paths=scripts,
         data_path=data_path,
@@ -136,6 +147,7 @@ def run(
         optimization_goal=optimization_goal.value,
         strategies=all_strategies,
         knowledge_graph_path=knowledge_graph_path,
+        retriever_script=retriever_script_path
     )
 
     # ===================================================
@@ -145,16 +157,54 @@ def run(
         final_output = optimizer.run()
 
     # ===================================================
-    # ⑤ Display Results
+    # ⑤ Results
     # ===================================================
     duration = time.time() - start_time
     console.rule(f"[bold green]Optimization Finished in {duration:.2f}s[/bold green]")
 
-    if final_output and final_output.get("best_single_model"):
-        console.print(Panel.fit("[bold blue]Best Model[/bold blue]"))
-        console.print(Pretty(final_output["best_single_model"]))
-    else:
+    best_model = final_output.get("best_model")
+    best_type = final_output.get("best_type")
+    best_code = final_output.get("best_script_code")
+
+    if best_model is None:
         console.print("[bold red]No successful models found.[/bold red]")
+        return
+
+    # ---------------------------------------------------
+    # Display model summary
+    # ---------------------------------------------------
+    console.print(Panel.fit(f"[bold blue]Best Model ({best_type})[/bold blue]"))
+    console.print(Pretty(best_model))
+
+    # ---------------------------------------------------
+    # Save code to best_script.py
+    # ---------------------------------------------------
+    if best_code:
+        output_path = Path("best_script.py")
+        output_path.write_text(best_code, encoding="utf-8")
+        console.print(f"[green]✅ Saved best model code to:[/green] {output_path.resolve()}")
+    else:
+        console.print("[yellow]⚠️ Best model has no code attached.[/yellow]")
+
+    # ---------------------------------------------------
+    # Display retriever and mutation info (optional)
+    # ---------------------------------------------------
+    retriever_result = final_output.get("retriever_baseline")
+    if retriever_result:
+        console.print("\n[cyan]Retriever baseline:[/cyan]")
+        console.print(Pretty(retriever_result))
+
+    console.print("\n[cyan]Mutation candidates:[/cyan]")
+    console.print(len(final_output.get("all_mutations", [])))
+
+    # ---------------------------------------------------
+    # Print ensemble summary
+    # ---------------------------------------------------
+    ensemble = final_output.get("final_ensemble_hparams")
+    if ensemble:
+        console.print("\n[magenta]Final Ensemble HParams:[/magenta]")
+        console.print(Pretty(ensemble))
+
 
 
 # ===================================================
