@@ -22,6 +22,7 @@ from mutation.strategies.hyperparameters import RandomHyperparameterMutation
 from mutation.strategies.structure import StructuralSwapStrategy
 from mutation.strategies.gp_feature_engineering import GPFeatureEngineeringStrategy
 from utils.code_normalizer import normalize_scripts
+from utils.dataset_summary import build_dataset_summary
 
 # ===================================================
 # Typer CLI setup
@@ -45,15 +46,31 @@ class OptimizationGoal(str, Enum):
 # ===================================================
 # Utility: Build mutation strategies dynamically
 # ===================================================
-def build_strategies(data_path: Path, use_gp: bool = True):
+def build_strategies(
+    data_path: Path,
+    metric_to_optimize: str,
+    use_gp: bool = True,
+    use_llm_filter: bool = False
+):
     """Return a list of active mutation strategies based on the dataset."""
     strategies = []
 
-    # Always include core strategies
+    # Dataset summary (solo si se va a usar el filtro LLM)
+    dataset_summary = None
+    if use_llm_filter:
+        try:
+            dataset_summary = build_dataset_summary(str(data_path), metric=metric_to_optimize)
+        except Exception as e:
+            console.print(f"[red]Error construyendo dataset_summary: {e}[/red]")
+            dataset_summary = None
+
+    # Core strategies
     hparam_strategy = RandomHyperparameterMutation()
-    structural_strategy = StructuralSwapStrategy()
+    structural_strategy = StructuralSwapStrategy(
+        use_llm_filter=use_llm_filter,
+        dataset_summary=dataset_summary
+    )
     strategies.extend([hparam_strategy, structural_strategy])
-    # strategies.extend([structural_strategy])
 
     # Conditional GP feature engineering
     if use_gp:
@@ -75,13 +92,16 @@ def build_strategies(data_path: Path, use_gp: bool = True):
 
                 gp_strategy = GPFeatureEngineeringStrategy(GP_FUNCTIONS, GP_TERMINALS)
                 strategies.append(gp_strategy)
-                console.print(f"[green]✅ GPFeatureEngineeringStrategy enabled ({len(numeric_cols)} numeric cols).[/green]")
+                console.print(
+                    f"[green]GPFeatureEngineeringStrategy enabled ({len(numeric_cols)} numeric cols).[/green]"
+                )
             else:
-                console.print("[yellow]⚠ No numeric columns detected, skipping GP strategy.[/yellow]")
+                console.print("[yellow]No numeric columns detected, skipping GP strategy.[/yellow]")
         except Exception as e:
-            console.print(f"[red]⚠ Failed to build GP strategy: {e}[/red]")
+            console.print(f"[red]Failed to build GP strategy: {e}[/red]")
 
     return strategies
+
 
 
 # ===================================================
@@ -97,7 +117,12 @@ def run(
     population: int = typer.Option(4, "--population", "-p"),
     knowledge_graph_path: Optional[Path] = typer.Option("knowledge_graph.pkl", "--kg-path", help="Path to KG.", exists=True),
     retriever_enabled: bool = typer.Option(False, "--retriever/--no-retriever", help="Enable GPT-5 Retriever step."),
-    use_gp: bool = typer.Option(True, "--gp/--no-gp", help="Enable GP-based feature engineering.")
+    use_gp: bool = typer.Option(True, "--gp/--no-gp", help="Enable GP-based feature engineering."),
+    llm_filter: bool = typer.Option(
+        False,
+        "--llm-filter/--no-llm-filter",
+        help="Use GPT-5 to pre-filter KG models in StructuralSwapStrategy."
+    ),
 ):
     """Run the AutoML optimizer with optional GPT-5 Retriever pre-step."""
 
@@ -127,11 +152,20 @@ def run(
         except Exception as e:
             console.print(f"[red]Retriever failed: {e}[/red]")
 
+    # This is for testing 
     from pathlib import Path
-    retriever_script_path = Path("retriever/cache/Logistic_Regression__SAGA__Pipeline.py")
+    best_initial_script = Path("Logistic_Regression__SAGA__Pipeline_optimizable.py")
+    retriever_script_path = Path("Logistic_Regression__SAGA__Pipeline_optimizable.py")
+    scripts = [best_initial_script]
+    console.print("[green]Retriever produced optimized initial script.[/green]")
 
     #  Build Mutation Strategies
-    all_strategies = build_strategies(data_path, use_gp=use_gp)
+    all_strategies = build_strategies(
+    data_path=data_path,
+    metric_to_optimize=metric_to_optimize,
+    use_gp=use_gp,
+    use_llm_filter=llm_filter
+    )
 
     #  Optimizer Setup
     config = OptimizerConfig(

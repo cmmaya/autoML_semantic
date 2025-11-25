@@ -12,6 +12,7 @@ from typing import Any, Optional, Dict, List, Tuple
 from .base_strategy import BaseStrategy
 from knowledge.graph_db import KnowledgeGraph, ComponentNode
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from utils.model_llm_filter import llm_filter_models
 
 
 # =============================================================================
@@ -198,11 +199,21 @@ class _ForceSingleThreadTransformer(ast.NodeTransformer):
 # =============================================================================
 
 class StructuralSwapStrategy(BaseStrategy):
-    def __init__(self):
+    def __init__(
+        self,
+        use_llm_filter: bool = False,
+        dataset_summary: Optional[Dict[str, Any]] = None
+    ):
         super().__init__(
             name="StructuralSwapStrategy",
-            description="Swaps a model with a compatible alternative (RandomForest → XGBoost, etc.)."
+            description="Swaps a model with a compatible alternative."
         )
+        self.use_llm_filter = use_llm_filter
+        self.dataset_summary = dataset_summary
+
+        # NEW: LLM cache to avoid repeated calls
+        self._cached_llm_filtered_models = None
+        self.failed_model_uids = set()
 
     def _add_import(self, tree: ast.AST, new_model_uid: str) -> ast.AST:
         """Adds correct import for the new model."""
@@ -272,12 +283,44 @@ class StructuralSwapStrategy(BaseStrategy):
         safe = [
             m for m in candidates
             if _is_instantiable_estimator(m.uid, require_proba=True)
+            and m.uid not in self.failed_model_uids      # skip models that failed earlier
         ]
+
         if not safe:
             return source_ast, hparams
 
+        # Optional LLM filtering, cached to avoid repeated calls
+        if self.use_llm_filter and self.dataset_summary:
+            try:
+                if self._cached_llm_filtered_models is None:
+                    # First time → call LLM
+                    logging.info(f"[{self.name}] Calling LLM model filter.")
+                    safe_llm = llm_filter_models(
+                        models=safe,
+                        dataset_summary=self.dataset_summary,
+                        top_k=5
+                    )
+                    if safe_llm:
+                        self._cached_llm_filtered_models = safe_llm
+                    else:
+                        self._cached_llm_filtered_models = safe  # fallback
+
+                # Reuse cached list
+                safe = [
+                    m for m in safe
+                    if m in self._cached_llm_filtered_models
+                ]
+
+                # If empty (rare), fallback to unfiltered list
+                if not safe:
+                    safe = self._cached_llm_filtered_models
+
+            except Exception as e:
+                logging.error(f"[{self.name}] Error in llm_filter_models: {e}")
+
         # 4) Swap
         new_model = random.choice(safe)
+
         swapper = _ModelSwapTransformer(current_name, new_model)
         new_ast = swapper.visit(source_ast)
         ast.fix_missing_locations(new_ast)

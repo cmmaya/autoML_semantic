@@ -206,7 +206,7 @@ class _SingleRunOptimizer:
                     result = self.executor.run(
                         temp_script_path, class_name, self.data_path, mutated_hparams
                     )
-
+                    
                     if result.status == 'SUCCESS':
                         self.code_archive[run_id] = new_code
                         result.hparams_used['run_id'] = run_id

@@ -1,3 +1,5 @@
+from sklearn.linear_model._logistic import LogisticRegressionCV
+
 import warnings
 warnings.filterwarnings('ignore')
 import pandas as pd
@@ -13,7 +15,7 @@ from sklearn.metrics import roc_auc_score
 
 class TitanicLogRegBaseline(Optimizable):
     """An optimizable script for the Titanic dataset."""
-    DEFAULT_HPARAMS: Hyperparameters = {'test_size': 0.2, 'random_state': 42, 'use_grid_search': True, 'cv': 5, 'n_jobs': 1, 'scoring': 'roc_auc', 'C': 1.0, 'penalty': 'l2', 'class_weight': None, 'grid_C': [0.1, 1.0, 10.0], 'grid_penalty': ['l2', 'l1'], 'grid_class_weight': [None, 'balanced']}
+    DEFAULT_HPARAMS: Hyperparameters = {'model__Cs': 10, 'model__fit_intercept': True, 'model__cv': None, 'model__dual': False, 'model__penalty': 'l2', 'model__scoring': None, 'model__solver': 'lbfgs', 'model__tol': 0.0001, 'model__max_iter': 100, 'model__class_weight': None, 'model__n_jobs': None, 'model__verbose': 0, 'model__refit': True, 'model__intercept_scaling': 1.0, 'model__multi_class': 'deprecated', 'model__random_state': None, 'model__l1_ratios': None}
 
     def run(self, hparams: Hyperparameters) -> Metrics:
         """Runs the training and evaluation pipeline."""
@@ -26,10 +28,10 @@ class TitanicLogRegBaseline(Optimizable):
         numeric_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
         categorical_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='most_frequent')), ('ohe', OneHotEncoder(handle_unknown='ignore'))])
         preprocess = ColumnTransformer(transformers=[('num', numeric_transformer, numeric_features), ('cat', categorical_transformer, categorical_features)])
-        model = LogisticRegression(solver='saga', max_iter=2000)
+        model = LogisticRegressionCV()
         pipeline = Pipeline(steps=[('preprocess', preprocess), ('model', model)])
         if hparams.get('use_grid_search', True):
-            param_grid = {'model__C': hparams.get('grid_C', [0.1, 1.0, 10.0]), 'model__penalty': hparams.get('grid_penalty', ['l2', 'l1']), 'model__class_weight': hparams.get('grid_class_weight', [None, 'balanced'])}
+            param_grid = {}
             search = GridSearchCV(estimator=pipeline, param_grid=param_grid, scoring=hparams.get('scoring', 'roc_auc'), cv=hparams.get('cv', 5), n_jobs=1)
             search.fit(X_train, y_train)
             best = search.best_estimator_
